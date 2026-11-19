@@ -40,5 +40,167 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    issues = []
+
+    # 1. Lấy dự đoán từ model nếu chưa được truyền vào
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    params = cfg["second_opinion"]
+
+    # 2. Duyệt từng ảnh
+    for image_path in ds.image_files():
+        stem = image_path.stem
+
+        if stem not in preds:
+            continue
+
+        lines = ds.read_label_lines(stem)
+
+        if lines is None:
+            continue
+
+        labels = ds.valid_boxes(stem)
+        predictions = preds[stem]
+
+        size = ds.image_size(stem)
+
+        if size is None:
+            continue
+
+        img_w, img_h = size
+
+        # 3. Lọc dự đoán theo confidence và diện tích
+        filtered_preds = []
+
+        for pred in predictions:
+            cls, conf, cx, cy, w, h = pred
+
+            if conf < params["conf"]:
+                continue
+
+            area_px = w * img_w * h * img_h
+
+            if area_px < params["min_area_px"]:
+                continue
+
+            filtered_preds.append(pred)
+
+        # 4. So sánh từng dự đoán với nhãn
+        for pred in filtered_preds:
+            pred_cls, conf, cx, cy, w, h = pred
+            pred_box = (cx, cy, w, h)
+
+            candidates = []
+
+            for label in labels:
+                label_cls = label[0]
+                label_box = label[1:]
+
+                iou = iou_xywh(pred_box, label_box)
+
+                if iou >= params["iou_missing"]:
+                    candidates.append((label_cls, iou))
+
+            # 4.1. Không có nhãn khớp -> có thể thiếu nhãn
+            if not candidates:
+                issues.append(Issue(
+                    check="second_opinion",
+                    severity=WARN,
+                    code="POSSIBLE_MISSING",
+                    image=stem,
+                    message="Model phát hiện vật thể chưa có nhãn",
+                    extra={"conf": conf}
+                ))
+                continue
+
+            # 4.2. Tìm nhãn cùng class
+            same_class_ious = [
+                iou for cls, iou in candidates
+                if cls == pred_cls
+            ]
+
+            if same_class_ious:
+                best_iou = max(same_class_ious)
+
+                if best_iou < params["iou_loose"]:
+                    issues.append(Issue(
+                        check="second_opinion",
+                        severity=WARN,
+                        code="POSSIBLE_LOOSE_BOX",
+                        image=stem,
+                        message="Bounding box có thể bị lỏng hoặc lệch",
+                        extra={
+                            "conf": conf,
+                            "iou": best_iou
+                        }
+                    ))
+
+                # Đã có nhãn cùng class, không xét wrong class
+                continue
+
+            # 4.3. Không có nhãn cùng class
+            other_class_ious = [
+                iou for cls, iou in candidates
+                if cls != pred_cls
+            ]
+
+            if other_class_ious:
+                best_iou = max(other_class_ious)
+
+                if best_iou >= params["iou_match"]:
+                    issues.append(Issue(
+                        check="second_opinion",
+                        severity=WARN,
+                        code="POSSIBLE_WRONG_CLASS",
+                        image=stem,
+                        message="Model và nhãn không thống nhất class",
+                        extra={
+                            "conf": conf,
+                            "iou": best_iou
+                        }
+                    ))
+
+        # 5. Kiểm tra nhãn có thể là False Positive
+        # Dùng fp_conf, không lọc min_area_px
+        fp_predictions = [
+            pred for pred in predictions
+            if pred[1] >= params["fp_conf"]
+        ]
+
+        # Duyệt dòng gốc để bảo toàn line number
+        for line_no, text in lines:
+            try:
+                label = parse_yolo_line(text)
+            except ValueError:
+                continue
+
+            label_cls = label[0]
+
+            if not (0 <= label_cls < len(ds.classes)):
+                continue
+
+            label_box = label[1:]
+
+            matched = False
+
+            for pred in fp_predictions:
+                pred_box = pred[2:]
+
+                iou = iou_xywh(label_box, pred_box)
+
+                if iou >= params["iou_missing"]:
+                    matched = True
+                    break
+
+            if not matched:
+                issues.append(Issue(
+                    check="second_opinion",
+                    severity=WARN,
+                    code="POSSIBLE_FALSE_POS",
+                    image=stem,
+                    line=line_no,
+                    message="Nhãn không khớp dự đoán nào của model"
+                ))
+
+    return issues
